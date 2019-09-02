@@ -174,6 +174,7 @@ extern crate libc;
 extern crate dwrote;
 
 extern crate app_units;
+extern crate arrayvec;
 extern crate bincode;
 extern crate byteorder;
 extern crate fxhash;
@@ -190,6 +191,7 @@ extern crate pathfinder_partitioner;
 extern crate pathfinder_path_utils;
 extern crate plane_split;
 extern crate rayon;
+extern crate rendy_descriptor;
 extern crate rendy_memory;
 extern crate ron;
 #[cfg(feature = "debugger")]
@@ -220,6 +222,10 @@ pub use renderer::{ExternalImage, ExternalImageHandler, ExternalImageSource, Gpu
 pub use renderer::{GraphicsApi, GraphicsApiInfo, PipelineInfo, Renderer, RendererOptions};
 pub use renderer::{RendererStats, SceneBuilderHooks, SurfaceHandles, ThreadListener};
 pub use renderer::MAX_VERTEX_TEXTURE_WIDTH;
+pub use rendy_memory::{DynamicConfig, HeapsConfig, LinearConfig};
 pub use shade::{Shaders, WrShaders};
 pub use webrender_api as api;
 pub use webrender_api::euclid;
+
+#[cfg(not(feature = "gleam"))]
+pub use device::BackendApiType;

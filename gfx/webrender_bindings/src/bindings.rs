@@ -1125,7 +1125,8 @@ pub extern "C" fn wr_window_new(window_id: WrWindowId,
     let notifier = Box::new(CppNotifier {
         window_id: window_id,
     });
-    let (renderer, sender) = match Renderer::new(
+    std::dbg!(println!("## width {:?}, height {:?}", window_width, window_height));
+    let (mut renderer, sender) = match Renderer::new(
         handles,
         window_width,
         window_height,

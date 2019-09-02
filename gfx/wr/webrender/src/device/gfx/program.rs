@@ -3,84 +3,43 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use api::{ColorF, DeviceIntRect, ImageFormat};
-use euclid::Transform3D;
 use hal::{self, Device as BackendDevice};
+use hal::command::{RawCommandBuffer, SubpassContents};
 use internal_types::FastHashMap;
 use smallvec::SmallVec;
 use rendy_memory::Heaps;
+use std::borrow::Cow::{Borrowed};
 
-use super::buffer::{InstanceBufferHandler, UniformBufferHandler, VertexBufferHandler};
+use super::buffer::{InstanceBufferHandler, VertexBufferHandler};
 use super::blend_state::SUBPIXEL_CONSTANT_TEXT_COLOR;
-use super::descriptor::DescriptorPools;
-use super::image::ImageCore;
 use super::render_pass::RenderPass;
-use super::vertex_types;
 use super::PipelineRequirements;
 use super::super::{ShaderKind, VertexArrayKind};
 use super::super::super::shader_source;
 
-use std::mem;
-
 const ENTRY_NAME: &str = "main";
-const MAX_INDEX_COUNT: usize = 4096;
+// The size of the push constant block is 68 bytes, and we upload it with u32 data (4 bytes).
+pub(super) const PUSH_CONSTANT_BLOCK_SIZE: usize = 17; // 68 / 4
 // The number of specialization constants in each shader.
-const SPECIALIZATION_CONSTANT_COUNT: usize = 5;
+const SPECIALIZATION_CONSTANT_COUNT: usize = 6;
 // Size of a specialization constant variable in bytes.
 const SPECIALIZATION_CONSTANT_SIZE: usize = 4;
-const SPECIALIZATION_FEATURES: &'static [&'static [&'static str]] = &[
-    &["ALPHA_PASS"],
-    &["COLOR_TARGET"],
-    &["GLYPH_TRANSFORM"],
-    &["DITHERING"],
-    &["DEBUG_OVERDRAW"],
-];
-const QUAD: [vertex_types::Vertex; 6] = [
-    vertex_types::Vertex {
-        aPosition: [0.0, 0.0, 0.0],
-    },
-    vertex_types::Vertex {
-        aPosition: [1.0, 0.0, 0.0],
-    },
-    vertex_types::Vertex {
-        aPosition: [0.0, 1.0, 0.0],
-    },
-    vertex_types::Vertex {
-        aPosition: [0.0, 1.0, 0.0],
-    },
-    vertex_types::Vertex {
-        aPosition: [1.0, 0.0, 0.0],
-    },
-    vertex_types::Vertex {
-        aPosition: [1.0, 1.0, 0.0],
-    },
+const SPECIALIZATION_FEATURES: &'static [&'static str] = &[
+    "ALPHA_PASS",
+    "COLOR_TARGET",
+    "GLYPH_TRANSFORM",
+    "DITHERING",
+    "DEBUG_OVERDRAW",
 ];
 
-impl ShaderKind {
-    pub(super) fn is_debug(&self) -> bool {
-        match *self {
-            ShaderKind::DebugFont | ShaderKind::DebugColor => true,
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-#[allow(non_snake_case)]
-pub struct Locals {
-    uTransform: [[f32; 4]; 4],
-    uMode: i32,
-}
 
 pub(crate) struct Program<B: hal::Backend> {
-    bindings_map: FastHashMap<String, u32>,
-    pipelines: FastHashMap<(hal::pso::BlendState, hal::pso::DepthTest), B::GraphicsPipeline>,
-    pub(super) vertex_buffer: SmallVec<[VertexBufferHandler<B>; 1]>,
+    pipelines: FastHashMap<(Option<hal::pso::BlendState>, Option<hal::pso::DepthTest>), B::GraphicsPipeline>,
+    pub(super) vertex_buffer: Option<SmallVec<[VertexBufferHandler<B>; 1]>>,
     pub(super) index_buffer: Option<SmallVec<[VertexBufferHandler<B>; 1]>>,
-    pub(super) instance_buffer: SmallVec<[InstanceBufferHandler<B>; 1]>,
-    pub(super) locals_buffer: SmallVec<[UniformBufferHandler<B>; 1]>,
     pub(super) shader_name: String,
     pub(super) shader_kind: ShaderKind,
-    pub(super) bound_textures: [u32; 16],
+    pub(super) constants: [u32; PUSH_CONSTANT_BLOCK_SIZE],
 }
 
 impl<B: hal::Backend> Program<B> {
@@ -98,6 +57,7 @@ impl<B: hal::Backend> Program<B> {
         shader_modules: &mut FastHashMap<String, (B::ShaderModule, B::ShaderModule)>,
         pipeline_cache: Option<&B::PipelineCache>,
         surface_format: ImageFormat,
+        use_push_consts: bool,
     ) -> Program<B> {
         if !shader_modules.contains_key(shader_name) {
             let vs_file = format!("{}.vert.spv", shader_name);
@@ -124,21 +84,30 @@ impl<B: hal::Backend> Program<B> {
 
         let (vs_module, fs_module) = shader_modules.get(shader_name).unwrap();
 
-        let mut constants = Vec::with_capacity(SPECIALIZATION_CONSTANT_COUNT);
         let mut specialization_data =
-            vec![0; SPECIALIZATION_CONSTANT_COUNT * SPECIALIZATION_CONSTANT_SIZE];
-        for i in 0 .. SPECIALIZATION_CONSTANT_COUNT {
-            constants.push(hal::pso::SpecializationConstant {
-                id: i as _,
-                range: (SPECIALIZATION_CONSTANT_SIZE * i) as _
-                    .. (SPECIALIZATION_CONSTANT_SIZE * (i + 1)) as _,
-            });
-            for (index, feature) in SPECIALIZATION_FEATURES[i].iter().enumerate() {
-                if features.contains(feature) {
-                    specialization_data[SPECIALIZATION_CONSTANT_SIZE * i] = (index + 1) as u8;
+            vec![0; (SPECIALIZATION_CONSTANT_COUNT - 1) * SPECIALIZATION_CONSTANT_SIZE];
+        let mut constants = SPECIALIZATION_FEATURES
+            .iter()
+            .zip(specialization_data.chunks_mut(SPECIALIZATION_CONSTANT_SIZE))
+            .enumerate()
+            .map(|(i, (feature, out_data))| {
+                out_data[0] = features.contains(feature) as u8;
+                hal::pso::SpecializationConstant {
+                    id: i as _,
+                    range: (SPECIALIZATION_CONSTANT_SIZE * i) as _
+                        .. (SPECIALIZATION_CONSTANT_SIZE * (i + 1)) as _,
                 }
-            }
-        }
+            })
+            .collect::<Vec<_>>();
+        constants.push(hal::pso::SpecializationConstant {
+            id: (SPECIALIZATION_CONSTANT_COUNT - 1) as _,
+            range: {
+                let from = (SPECIALIZATION_CONSTANT_COUNT - 1) * SPECIALIZATION_CONSTANT_SIZE;
+                let to = from + SPECIALIZATION_CONSTANT_SIZE;
+                from as _ .. to as _
+            },
+        });
+        specialization_data.extend_from_slice(&[use_push_consts as u8, 0, 0, 0]);
 
         let pipelines = {
             let (vs_entry, fs_entry) = (
@@ -146,16 +115,16 @@ impl<B: hal::Backend> Program<B> {
                     entry: ENTRY_NAME,
                     module: &vs_module,
                     specialization: hal::pso::Specialization {
-                        constants: &constants,
-                        data: &specialization_data.as_slice(),
+                        constants: Borrowed(&constants),
+                        data: Borrowed(&specialization_data.as_slice()),
                     },
                 },
                 hal::pso::EntryPoint::<B> {
                     entry: ENTRY_NAME,
                     module: &fs_module,
                     specialization: hal::pso::Specialization {
-                        constants: &constants,
-                        data: &specialization_data.as_slice(),
+                        constants: Borrowed(&constants),
+                        data: Borrowed(&specialization_data.as_slice()),
                     },
                 },
             );
@@ -168,83 +137,83 @@ impl<B: hal::Backend> Program<B> {
                 fragment: Some(fs_entry),
             };
 
-            use hal::pso::{BlendState, DepthTest};
+            use hal::pso::{BlendState};
             use super::blend_state::*;
             use super::{LESS_EQUAL_TEST, LESS_EQUAL_WRITE};
 
             let pipeline_states = match shader_kind {
                 ShaderKind::Cache(VertexArrayKind::Scale) => [
-                    (BlendState::Off, DepthTest::Off),
-                    (BlendState::MULTIPLY, DepthTest::Off),
+                    (None, None),
+                    (Some(BlendState::MULTIPLY), None),
                 ]
                 .into_iter(),
                 ShaderKind::Cache(VertexArrayKind::Blur) => [
-                    (BlendState::Off, DepthTest::Off),
-                    (BlendState::Off, LESS_EQUAL_TEST),
+                    (None, None),
+                    (None, Some(LESS_EQUAL_TEST)),
                 ]
                 .into_iter(),
                 ShaderKind::Cache(VertexArrayKind::Border)
                 | ShaderKind::Cache(VertexArrayKind::LineDecoration) => {
-                    [(BlendState::PREMULTIPLIED_ALPHA, DepthTest::Off)].into_iter()
+                    [(Some(BlendState::PREMULTIPLIED_ALPHA), None)].into_iter()
                 }
-                ShaderKind::ClipCache => [(BlendState::MULTIPLY, DepthTest::Off)].into_iter(),
+                ShaderKind::ClipCache => [(Some(BlendState::MULTIPLY), None)].into_iter(),
                 ShaderKind::Text => {
                     if features.contains(&"DUAL_SOURCE_BLENDING") {
                         [
-                            (BlendState::PREMULTIPLIED_ALPHA, DepthTest::Off),
-                            (BlendState::PREMULTIPLIED_ALPHA, LESS_EQUAL_TEST),
-                            (SUBPIXEL_CONSTANT_TEXT_COLOR, DepthTest::Off),
-                            (SUBPIXEL_CONSTANT_TEXT_COLOR, LESS_EQUAL_TEST),
-                            (SUBPIXEL_PASS0, DepthTest::Off),
-                            (SUBPIXEL_PASS0, LESS_EQUAL_TEST),
-                            (SUBPIXEL_PASS1, DepthTest::Off),
-                            (SUBPIXEL_PASS1, LESS_EQUAL_TEST),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS0, DepthTest::Off),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS0, LESS_EQUAL_TEST),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS1, DepthTest::Off),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS1, LESS_EQUAL_TEST),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS2, DepthTest::Off),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS2, LESS_EQUAL_TEST),
-                            (SUBPIXEL_DUAL_SOURCE, DepthTest::Off),
-                            (SUBPIXEL_DUAL_SOURCE, LESS_EQUAL_TEST),
+                            (Some(BlendState::PREMULTIPLIED_ALPHA), None),
+                            (Some(BlendState::PREMULTIPLIED_ALPHA), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_CONSTANT_TEXT_COLOR), None),
+                            (Some(SUBPIXEL_CONSTANT_TEXT_COLOR), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_PASS0), None),
+                            (Some(SUBPIXEL_PASS0), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_PASS1), None),
+                            (Some(SUBPIXEL_PASS1), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS0), None),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS0), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS1), None),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS1), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS2), None),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS2), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_DUAL_SOURCE), None),
+                            (Some(SUBPIXEL_DUAL_SOURCE), Some(LESS_EQUAL_TEST)),
                         ]
                         .into_iter()
                     } else {
                         [
-                            (BlendState::PREMULTIPLIED_ALPHA, DepthTest::Off),
-                            (BlendState::PREMULTIPLIED_ALPHA, LESS_EQUAL_TEST),
-                            (SUBPIXEL_CONSTANT_TEXT_COLOR, DepthTest::Off),
-                            (SUBPIXEL_CONSTANT_TEXT_COLOR, LESS_EQUAL_TEST),
-                            (SUBPIXEL_PASS0, DepthTest::Off),
-                            (SUBPIXEL_PASS0, LESS_EQUAL_TEST),
-                            (SUBPIXEL_PASS1, DepthTest::Off),
-                            (SUBPIXEL_PASS1, LESS_EQUAL_TEST),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS0, DepthTest::Off),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS0, LESS_EQUAL_TEST),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS1, DepthTest::Off),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS1, LESS_EQUAL_TEST),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS2, DepthTest::Off),
-                            (SUBPIXEL_WITH_BG_COLOR_PASS2, LESS_EQUAL_TEST),
+                            (Some(BlendState::PREMULTIPLIED_ALPHA), None),
+                            (Some(BlendState::PREMULTIPLIED_ALPHA), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_CONSTANT_TEXT_COLOR), None),
+                            (Some(SUBPIXEL_CONSTANT_TEXT_COLOR), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_PASS0), None),
+                            (Some(SUBPIXEL_PASS0), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_PASS1), None),
+                            (Some(SUBPIXEL_PASS1), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS0), None),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS0), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS1), None),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS1), Some(LESS_EQUAL_TEST)),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS2), None),
+                            (Some(SUBPIXEL_WITH_BG_COLOR_PASS2), Some(LESS_EQUAL_TEST)),
                         ]
                         .into_iter()
                     }
                 }
                 ShaderKind::DebugColor | ShaderKind::DebugFont => {
-                    [(BlendState::PREMULTIPLIED_ALPHA, DepthTest::Off)].into_iter()
+                    [(Some(BlendState::PREMULTIPLIED_ALPHA), None)].into_iter()
                 }
                 _ => [
-                    (BlendState::Off, DepthTest::Off),
-                    (BlendState::Off, LESS_EQUAL_TEST),
-                    (BlendState::Off, LESS_EQUAL_WRITE),
-                    (ALPHA, DepthTest::Off),
-                    (ALPHA, LESS_EQUAL_TEST),
-                    (ALPHA, LESS_EQUAL_WRITE),
-                    (BlendState::PREMULTIPLIED_ALPHA, DepthTest::Off),
-                    (BlendState::PREMULTIPLIED_ALPHA, LESS_EQUAL_TEST),
-                    (BlendState::PREMULTIPLIED_ALPHA, LESS_EQUAL_WRITE),
-                    (PREMULTIPLIED_DEST_OUT, DepthTest::Off),
-                    (PREMULTIPLIED_DEST_OUT, LESS_EQUAL_TEST),
-                    (PREMULTIPLIED_DEST_OUT, LESS_EQUAL_WRITE),
+                    (None, None),
+                    (None, Some(LESS_EQUAL_TEST)),
+                    (None, Some(LESS_EQUAL_WRITE)),
+                    (Some(ALPHA), None),
+                    (Some(ALPHA), Some(LESS_EQUAL_TEST)),
+                    (Some(ALPHA), Some(LESS_EQUAL_WRITE)),
+                    (Some(BlendState::PREMULTIPLIED_ALPHA), None),
+                    (Some(BlendState::PREMULTIPLIED_ALPHA), Some(LESS_EQUAL_TEST)),
+                    (Some(BlendState::PREMULTIPLIED_ALPHA), Some(LESS_EQUAL_WRITE)),
+                    (Some(PREMULTIPLIED_DEST_OUT), None),
+                    (Some(PREMULTIPLIED_DEST_OUT), Some(LESS_EQUAL_TEST)),
+                    (Some(PREMULTIPLIED_DEST_OUT), Some(LESS_EQUAL_WRITE)),
                 ]
                 .into_iter(),
             };
@@ -264,7 +233,7 @@ impl<B: hal::Backend> Program<B> {
                 let subpass = hal::pass::Subpass {
                     index: 0,
                     main_pass: render_pass
-                        .get_render_pass(format, depth_test != hal::pso::DepthTest::Off),
+                        .get_render_pass(format, depth_test != None),
                 };
                 let mut pipeline_descriptor = hal::pso::GraphicsPipelineDesc::new(
                     shader_entries.clone(),
@@ -276,15 +245,15 @@ impl<B: hal::Backend> Program<B> {
                 pipeline_descriptor
                     .blender
                     .targets
-                    .push(hal::pso::ColorBlendDesc(
-                        hal::pso::ColorMask::ALL,
-                        blend_state,
-                    ));
+                    .push(hal::pso::ColorBlendDesc{
+                        mask: hal::pso::ColorMask::ALL,
+                        blend: blend_state,
+                    });
 
                 pipeline_descriptor.depth_stencil = hal::pso::DepthStencilDesc {
                     depth: depth_test,
                     depth_bounds: false,
-                    stencil: hal::pso::StencilTest::Off,
+                    stencil: None,
                 };
 
                 pipeline_descriptor.vertex_buffers =
@@ -303,10 +272,10 @@ impl<B: hal::Backend> Program<B> {
             let mut states = pipeline_states
                 .cloned()
                 .zip(pipelines.map(|pipeline| pipeline.expect("Pipeline creation failed")))
-                .collect::<FastHashMap<(hal::pso::BlendState, hal::pso::DepthTest), B::GraphicsPipeline>>();
+                .collect::<FastHashMap<(Option<hal::pso::BlendState>, Option<hal::pso::DepthTest>), B::GraphicsPipeline>>();
 
             if features.contains(&"DEBUG_OVERDRAW") {
-                let pipeline_state = (OVERDRAW, LESS_EQUAL_TEST);
+                let pipeline_state = (Some(OVERDRAW), Some(LESS_EQUAL_TEST));
                 let pipeline_descriptor = create_desc(pipeline_state);
                 let pipeline = unsafe {
                     device.create_graphics_pipeline(&pipeline_descriptor, pipeline_cache)
@@ -318,214 +287,79 @@ impl<B: hal::Backend> Program<B> {
             states
         };
 
-        let vertex_buffer_stride = match shader_kind {
-            ShaderKind::DebugColor => mem::size_of::<vertex_types::DebugColorVertex>(),
-            ShaderKind::DebugFont => mem::size_of::<vertex_types::DebugFontVertex>(),
-            _ => mem::size_of::<vertex_types::Vertex>(),
-        };
-
-        let instance_buffer_stride = match shader_kind {
-            ShaderKind::Primitive
-            | ShaderKind::Brush
-            | ShaderKind::Text
-            | ShaderKind::Cache(VertexArrayKind::Primitive) => {
-                mem::size_of::<vertex_types::PrimitiveInstanceData>()
-            }
-            ShaderKind::ClipCache | ShaderKind::Cache(VertexArrayKind::Clip) => {
-                mem::size_of::<vertex_types::ClipMaskInstance>()
-            }
-            ShaderKind::Cache(VertexArrayKind::Blur) => {
-                mem::size_of::<vertex_types::BlurInstance>()
-            }
-            ShaderKind::Cache(VertexArrayKind::Border) => {
-                mem::size_of::<vertex_types::BorderInstance>()
-            }
-            ShaderKind::Cache(VertexArrayKind::Scale) => {
-                mem::size_of::<vertex_types::ScalingInstance>()
-            }
-            ShaderKind::Cache(VertexArrayKind::LineDecoration) => {
-                mem::size_of::<vertex_types::LineDecorationInstance>()
-            }
-            sk if sk.is_debug() => 1,
-            _ => unreachable!(),
-        };
-
-        let mut vertex_buffer = SmallVec::new();
-        let mut instance_buffer = SmallVec::new();
-        let mut locals_buffer = SmallVec::new();
-        let mut index_buffer = if shader_kind.is_debug() {
-            Some(SmallVec::new())
+        let (mut vertex_buffer, mut index_buffer) = if shader_kind.is_debug() {
+            (Some(SmallVec::new()), Some(SmallVec::new()))
         } else {
-            None
+            (None, None)
         };
         for _ in 0 .. frame_count {
-            vertex_buffer.push(VertexBufferHandler::new(
-                device,
-                heaps,
-                hal::buffer::Usage::VERTEX,
-                &QUAD,
-                vertex_buffer_stride,
-                (limits.optimal_buffer_copy_pitch_alignment - 1) as usize,
-                (limits.non_coherent_atom_size - 1) as usize,
-            ));
-            instance_buffer.push(InstanceBufferHandler::new(
-                device,
-                heaps,
-                instance_buffer_stride,
-                (limits.non_coherent_atom_size - 1) as usize,
-                (limits.optimal_buffer_copy_pitch_alignment - 1) as usize,
-            ));
-            locals_buffer.push(UniformBufferHandler::new(
-                hal::buffer::Usage::UNIFORM,
-                mem::size_of::<Locals>(),
-                (limits.min_uniform_buffer_offset_alignment - 1) as usize,
-                (limits.non_coherent_atom_size - 1) as usize,
-            ));
+            if let Some(ref mut vertex_buffer) = vertex_buffer {
+                vertex_buffer.push(VertexBufferHandler::new(
+                    device,
+                    heaps,
+                    hal::buffer::Usage::VERTEX,
+                    &[0u8],
+                    (limits.optimal_buffer_copy_pitch_alignment - 1) as usize,
+                    (limits.non_coherent_atom_size - 1) as usize,
+                ));
+            }
             if let Some(ref mut index_buffer) = index_buffer {
                 index_buffer.push(VertexBufferHandler::new(
                     device,
                     heaps,
                     hal::buffer::Usage::INDEX,
-                    &vec![0u32; MAX_INDEX_COUNT],
-                    mem::size_of::<u32>(),
+                    &[0u8],
                     (limits.optimal_buffer_copy_pitch_alignment - 1) as usize,
                     (limits.non_coherent_atom_size - 1) as usize,
                 ));
             }
         }
 
-        let bindings_map = pipeline_requirements.bindings_map;
-
         Program {
-            bindings_map,
             pipelines,
             vertex_buffer,
             index_buffer,
-            instance_buffer,
-            locals_buffer,
             shader_name: String::from(shader_name),
             shader_kind,
-            bound_textures: [0; 16],
-        }
-    }
-
-    pub(super) fn bind_instances<T: Copy>(
-        &mut self,
-        device: &B::Device,
-        heaps: &mut Heaps<B>,
-        instances: &[T],
-        buffer_id: usize,
-    ) {
-        assert!(!instances.is_empty());
-        self.instance_buffer[buffer_id].add(device, instances, heaps);
-    }
-
-    pub(super) fn bind_locals(
-        &mut self,
-        device: &B::Device,
-        heaps: &mut Heaps<B>,
-        set: &B::DescriptorSet,
-        projection: &Transform3D<f32>,
-        u_mode: i32,
-        buffer_id: usize,
-    ) {
-        let locals_data = Locals {
-            uTransform: projection.to_row_arrays(),
-            uMode: u_mode,
-        };
-        self.locals_buffer[buffer_id].add(device, &[locals_data], heaps);
-        unsafe {
-            device.write_descriptor_sets(Some(hal::pso::DescriptorSetWrite {
-                set,
-                binding: self.bindings_map["Locals"],
-                array_offset: 0,
-                descriptors: Some(hal::pso::Descriptor::Buffer(
-                    &self.locals_buffer[buffer_id].buffer().buffer,
-                    Some(0) .. None,
-                )),
-            }));
-        }
-    }
-
-    pub(super) fn bind_texture(
-        &self,
-        device: &B::Device,
-        set: &B::DescriptorSet,
-        image: &ImageCore<B>,
-        binding: &'static str,
-        cmd_buffer: &mut hal::command::CommandBuffer<B, hal::Graphics>,
-    ) {
-        if let Some(binding) = self.bindings_map.get(&("t".to_owned() + binding)) {
-            unsafe {
-                let mut src_stage = Some(hal::pso::PipelineStage::empty());
-                if let Some(barrier) = image.transit(
-                    hal::image::Access::SHADER_READ,
-                    hal::image::Layout::ShaderReadOnlyOptimal,
-                    image.subresource_range.clone(),
-                    src_stage.as_mut(),
-                ) {
-                    cmd_buffer.pipeline_barrier(
-                        src_stage.unwrap()
-                            .. hal::pso::PipelineStage::FRAGMENT_SHADER,
-                        hal::memory::Dependencies::empty(),
-                        &[barrier],
-                    );
-                }
-                device.write_descriptor_sets(Some(hal::pso::DescriptorSetWrite {
-                    set,
-                    binding: *binding,
-                    array_offset: 0,
-                    descriptors: Some(hal::pso::Descriptor::Image(
-                        &image.view,
-                        hal::image::Layout::ShaderReadOnlyOptimal,
-                    )),
-                }));
-            }
-        }
-    }
-
-    pub(super) fn bind_sampler(
-        &self,
-        device: &B::Device,
-        set: &B::DescriptorSet,
-        sampler: &B::Sampler,
-        binding: &'static str,
-    ) {
-        if let Some(binding) = self.bindings_map.get(&("s".to_owned() + binding)) {
-            unsafe {
-                device.write_descriptor_sets(Some(hal::pso::DescriptorSetWrite {
-                    set,
-                    binding: *binding,
-                    array_offset: 0,
-                    descriptors: Some(hal::pso::Descriptor::Sampler(sampler)),
-                }));
-            }
+            constants: [0; PUSH_CONSTANT_BLOCK_SIZE],
         }
     }
 
     pub(super) fn submit(
-        &self,
-        cmd_buffer: &mut hal::command::CommandBuffer<B, hal::Graphics>,
+        &mut self,
+        cmd_buffer: &mut B::CommandBuffer,
         viewport: hal::pso::Viewport,
         render_pass: &B::RenderPass,
         frame_buffer: &B::Framebuffer,
-        desc_pools: &mut DescriptorPools<B>,
-        desc_pools_global: &mut DescriptorPools<B>,
-        desc_pools_sampler: &mut DescriptorPools<B>,
-        clear_values: &[hal::command::ClearValue],
-        blend_state: hal::pso::BlendState,
+        desc_set_per_draw: &B::DescriptorSet,
+        desc_set_per_pass: Option<&B::DescriptorSet>,
+        desc_set_per_frame: &B::DescriptorSet,
+        desc_set_locals: Option<&B::DescriptorSet>,
+        clear_values: &[hal::command::ClearValueRaw],
+        blend_state: Option<hal::pso::BlendState>,
         blend_color: ColorF,
-        depth_test: hal::pso::DepthTest,
+        depth_test: Option<hal::pso::DepthTest>,
         scissor_rect: Option<DeviceIntRect>,
         next_id: usize,
-        pipeline_layouts: &FastHashMap<ShaderKind, B::PipelineLayout>,
-        pipeline_requirements: &FastHashMap<String, PipelineRequirements>,
-        device: &B::Device,
+        pipeline_layout: &B::PipelineLayout,
+        use_push_consts: bool,
+        vertex_buffer: &VertexBufferHandler<B>,
+        instance_buffer: &InstanceBufferHandler<B>,
+        instance_range: std::ops::Range<usize>,
     ) {
-        let vertex_buffer = &self.vertex_buffer[next_id];
-        let instance_buffer = &self.instance_buffer[next_id];
-
+        let vertex_buffer = match &self.vertex_buffer {
+            Some(ref vb) => vb.get(next_id).unwrap(),
+            None => vertex_buffer
+        };
         unsafe {
+            if use_push_consts {
+                cmd_buffer.push_graphics_constants(
+                    pipeline_layout,
+                    hal::pso::ShaderStageFlags::VERTEX,
+                    0,
+                    &self.constants,
+                );
+            }
             cmd_buffer.set_viewports(0, &[viewport.clone()]);
             match scissor_rect {
                 Some(r) => cmd_buffer.set_scissors(
@@ -549,20 +383,21 @@ impl<B: hal::Backend> Program<B> {
                     )),
             );
 
+            if !use_push_consts {
+                assert!(desc_set_locals.is_some());
+            }
+            use std::iter;
             cmd_buffer.bind_graphics_descriptor_sets(
-                &pipeline_layouts[&self.shader_kind],
-                0,
-                Some(desc_pools.get(&self.shader_kind))
-                    .into_iter()
-                    .chain(Some(desc_pools_global.get(&self.shader_kind)))
-                    .chain(Some(desc_pools_sampler.get(&self.shader_kind))),
+                pipeline_layout,
+                if desc_set_per_pass.is_some() { 0 } else { 1 },
+                desc_set_per_pass.into_iter()
+                    .chain(iter::once(desc_set_per_frame))
+                    .chain(iter::once(desc_set_per_draw))
+                    .chain(desc_set_locals),
                 &[],
             );
-            desc_pools.next(&self.shader_kind, device, pipeline_requirements);
-            desc_pools_global.next(&self.shader_kind, device, pipeline_requirements);
-            desc_pools_sampler.next(&self.shader_kind, device, pipeline_requirements);
 
-            if blend_state == SUBPIXEL_CONSTANT_TEXT_COLOR {
+            if blend_state == Some(SUBPIXEL_CONSTANT_TEXT_COLOR) {
                 cmd_buffer.set_blend_constants(blend_color.to_array());
             }
 
@@ -574,22 +409,23 @@ impl<B: hal::Backend> Program<B> {
                     index_type: hal::IndexType::U32,
                 });
 
-                {
-                    let mut encoder = cmd_buffer.begin_render_pass_inline(
-                        render_pass,
-                        frame_buffer,
-                        viewport.rect,
-                        clear_values,
-                    );
+                cmd_buffer.begin_render_pass(
+                    render_pass,
+                    frame_buffer,
+                    viewport.rect,
+                    clear_values,
+                    SubpassContents::Inline,
+                );
 
-                    encoder.draw_indexed(
-                        0 .. index_buffer[next_id].buffer().buffer_len as u32,
-                        0,
-                        0 .. 1,
-                    );
-                }
+                cmd_buffer.draw_indexed(
+                    0 .. index_buffer[next_id].buffer().buffer_len as u32,
+                    0,
+                    0 .. 1,
+                );
+
+                cmd_buffer.end_render_pass();
             } else {
-                for i in 0 ..= instance_buffer.current_buffer_index {
+                for i in instance_range.into_iter() {
                     cmd_buffer.bind_vertex_buffers(
                         0,
                         Some((&vertex_buffer.buffer().buffer, 0))
@@ -597,39 +433,38 @@ impl<B: hal::Backend> Program<B> {
                             .chain(Some((&instance_buffer.buffers[i].buffer.buffer, 0))),
                     );
 
-                    {
-                        let mut encoder = cmd_buffer.begin_render_pass_inline(
-                            render_pass,
-                            frame_buffer,
-                            viewport.rect,
-                            clear_values,
-                        );
-                        let offset = instance_buffer.buffers[i].offset;
-                        let size = instance_buffer.buffers[i].last_update_size;
-                        encoder.draw(
-                            0 .. vertex_buffer.buffer_len as _,
-                            (offset - size) as u32 .. offset as u32,
-                        );
-                    }
+                    cmd_buffer.begin_render_pass(
+                        render_pass,
+                        frame_buffer,
+                        viewport.rect,
+                        clear_values,
+                        SubpassContents::Inline,
+                    );
+
+                    let data_stride = instance_buffer.buffers[i].last_data_stride;
+                    let end = instance_buffer.buffers[i].offset / data_stride;
+                    let start = end - instance_buffer.buffers[i].last_update_size / data_stride;
+                    cmd_buffer.draw(
+                        0 .. vertex_buffer.buffer_len as _,
+                        start as u32 .. end as u32,
+                    );
+
+                    cmd_buffer.end_render_pass();
                 }
             }
         }
     }
 
     pub(super) fn deinit(mut self, device: &B::Device, heaps: &mut Heaps<B>) {
-        for mut vertex_buffer in self.vertex_buffer {
-            vertex_buffer.deinit(device, heaps);
-        }
-        if let Some(index_buffer) = self.index_buffer {
-            for mut index_buffer in index_buffer {
-                index_buffer.deinit(device, heaps);
+        if let Some(vertex_buffer) = self.vertex_buffer {
+            for vertex_buffer in vertex_buffer {
+                vertex_buffer.deinit(device, heaps);
             }
         }
-        for mut instance_buffer in self.instance_buffer {
-            instance_buffer.deinit(device, heaps);
-        }
-        for mut locals_buffer in self.locals_buffer {
-            locals_buffer.deinit(device, heaps);
+        if let Some(index_buffer) = self.index_buffer {
+            for index_buffer in index_buffer {
+                index_buffer.deinit(device, heaps);
+            }
         }
         for pipeline in self.pipelines.drain() {
             unsafe { device.destroy_graphics_pipeline(pipeline.1) };
